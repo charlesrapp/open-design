@@ -22,6 +22,7 @@ describe('pruna media generation', () => {
   // the suite on a machine that exports it for the Pruna SDK would otherwise
   // satisfy the no-credential case from the ambient environment.
   const originalPrunaKey = process.env.PRUNA_API_KEY;
+  const originalPrunaRequestTimeout = process.env.OD_PRUNA_REQUEST_TIMEOUT_MS;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(tmpdir(), 'od-pruna-'));
@@ -32,6 +33,7 @@ describe('pruna media generation', () => {
     delete process.env.OD_DATA_DIR;
     delete process.env.OD_MEDIA_MODEL_ALIASES;
     delete process.env.PRUNA_API_KEY;
+    delete process.env.OD_PRUNA_REQUEST_TIMEOUT_MS;
     process.env.OD_PRUNA_API_KEY = 'pruna-test-key';
   });
 
@@ -43,6 +45,11 @@ describe('pruna media generation', () => {
       delete process.env.PRUNA_API_KEY;
     } else {
       process.env.PRUNA_API_KEY = originalPrunaKey;
+    }
+    if (originalPrunaRequestTimeout == null) {
+      delete process.env.OD_PRUNA_REQUEST_TIMEOUT_MS;
+    } else {
+      process.env.OD_PRUNA_REQUEST_TIMEOUT_MS = originalPrunaRequestTimeout;
     }
     if (originalMediaConfigDir == null) {
       delete process.env.OD_MEDIA_CONFIG_DIR;
@@ -62,6 +69,14 @@ describe('pruna media generation', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
+  }
+
+  async function writeMediaConfig(entry: Record<string, unknown>) {
+    await writeFile(
+      path.join(projectRoot, '.od', 'media-config.json'),
+      JSON.stringify({ providers: { pruna: entry } }),
+      'utf8',
+    );
   }
 
   /**
@@ -518,6 +533,505 @@ describe('pruna media generation', () => {
     })).rejects.toThrow(/download returned 0 bytes/);
   });
 
+  it('rejects a cross-origin status URL before sending the API key', async () => {
+    const calls: Call[] = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith('/predictions')) {
+        return jsonResponse({
+          id: 'cross-origin-status',
+          get_url: 'https://attacker.example/status/cross-origin-status',
+        });
+      }
+      return jsonResponse({
+        status: 'succeeded',
+        generation_url: 'https://attacker.example/output.jpg',
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Do not leak the key',
+      output: 'blocked-status.png',
+    })).rejects.toThrow(/status URL.*origin/i);
+    expect(calls.some((call) => call.url.startsWith('https://attacker.example'))).toBe(false);
+  });
+
+  it('rejects a cross-origin delivery URL before sending the API key', async () => {
+    const calls: Call[] = [];
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith('/predictions')) {
+        return jsonResponse({
+          status: 'succeeded',
+          generation_url: 'https://attacker.example/output.jpg',
+        });
+      }
+      return new Response(PNG_BYTES, { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Do not leak the key',
+      output: 'blocked-delivery.png',
+    })).rejects.toThrow(/delivery URL.*origin/i);
+    expect(calls.some((call) => call.url.startsWith('https://attacker.example'))).toBe(false);
+  });
+
+  it('pins redirect:error and a timeout signal on every authenticated request', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'ref.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/guarded/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Guard every request',
+      image: 'ref.png',
+      output: 'guarded.png',
+    });
+
+    expect(calls.map((call) => call.url)).toEqual(expect.arrayContaining([
+      'https://api.pruna.ai/v1/files',
+      'https://api.pruna.ai/v1/predictions',
+      'https://api.pruna.ai/v1/predictions/status/1zww7deyssrme0csqwr90phzzr',
+      'https://api.pruna.ai/v1/predictions/delivery/xezq/guarded/output.jpg',
+    ]));
+    for (const call of calls) {
+      expect(call.init?.redirect, call.url).toBe('error');
+      expect(call.init?.signal, call.url).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('rejects a non-HTTPS Pruna base URL before making a request', async () => {
+    await writeMediaConfig({ baseUrl: 'http://gateway.example/pruna/v1' });
+    const fetchMock = vi.fn(async () => {
+      throw new Error('network should not be reached for an insecure base URL');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'HTTPS only',
+      output: 'https-only.png',
+    })).rejects.toThrow(/Pruna base URL.*HTTPS/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an oversized JSON response without buffering it as provider data', async () => {
+    const fetchMock = vi.fn(async () => new Response('x'.repeat(1_100_000), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Bound JSON responses',
+      output: 'bounded-json.png',
+    })).rejects.toThrow(/Pruna submit response exceeds/i);
+  });
+
+  it('rejects a delivery whose declared size exceeds the output cap', async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/predictions')) {
+        return jsonResponse({
+          status: 'succeeded',
+          generation_url: 'https://api.pruna.ai/v1/predictions/delivery/xezq/huge/output.jpg',
+        });
+      }
+      return new Response(PNG_BYTES, {
+        status: 200,
+        headers: { 'content-length': String(1024 * 1024 * 1024) },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Bound delivery responses',
+      output: 'bounded-delivery.png',
+    })).rejects.toThrow(/Pruna image response exceeds/i);
+  });
+
+  it('rejects more than five Pruna references before reading or uploading them', async () => {
+    for (const name of ['a.png', 'b.png', 'c.png', 'd.png', 'e.png', 'f.png']) {
+      await writeFile(path.join(projectsRoot, 'project-1', name), PNG_BYTES);
+    }
+    const fetchMock = vi.fn(async () => {
+      throw new Error('network should not be reached for too many references');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Too many inputs',
+      image: 'a.png',
+      images: ['b.png', 'c.png', 'd.png', 'e.png', 'f.png'],
+      output: 'too-many.png',
+    })).rejects.toThrow(/Pruna accepts at most 5 uploaded references per request; received 6/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('allows five distinct references in the CLI body shape without double-counting the primary', async () => {
+    for (const name of ['a.png', 'b.png', 'c.png', 'd.png', 'e.png']) {
+      await writeFile(path.join(projectsRoot, 'project-1', name), PNG_BYTES);
+    }
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/five/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Five distinct references',
+      image: 'a.png',
+      // The CLI sends the primary in both fields.
+      images: ['a.png', 'b.png', 'c.png', 'd.png', 'e.png'],
+      output: 'five.png',
+    });
+
+    expect(calls.filter((call) => call.url.endsWith('/files'))).toHaveLength(5);
+  });
+
+  it('uses qwen-image-edit-plus image array and match-input default', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'a.png'), PNG_BYTES);
+    await writeFile(path.join(projectsRoot, 'project-1', 'b.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/qwen/output.webp',
+      outputBytes: PNG_BYTES,
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'qwen-image-edit-plus-pruna',
+      prompt: 'Transfer the pose',
+      image: 'a.png',
+      images: ['b.png'],
+      output: 'qwen.png',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    const input = JSON.parse(String(submit?.init?.body)).input;
+    expect(input.image).toEqual([
+      'https://api.pruna.ai/v1/files/file-abc123',
+      'https://api.pruna.ai/v1/files/file-abc123',
+    ]);
+    expect(input).not.toHaveProperty('images');
+    expect(input.aspect_ratio).toBe('match_input_image');
+  });
+
+  it('rejects more than two references for qwen-image-edit-plus before upload', async () => {
+    for (const name of ['a.png', 'b.png', 'c.png']) {
+      await writeFile(path.join(projectsRoot, 'project-1', name), PNG_BYTES);
+    }
+    const fetchMock = vi.fn(async () => {
+      throw new Error('network should not be reached above the Qwen limit');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'qwen-image-edit-plus-pruna',
+      prompt: 'Too many Qwen references',
+      image: 'a.png',
+      images: ['b.png', 'c.png'],
+      output: 'qwen-too-many.png',
+    })).rejects.toThrow(/qwen-image-edit-plus accepts at most 2 reference images/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the first images entry as the wan-i2v primary reference', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'still.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/wan/output.mp4',
+      outputBytes: MP4_BYTES,
+      submitBody: { id: 'wan', get_url: '/v1/predictions/status/wan' },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'video',
+      model: 'wan-i2v-pruna',
+      prompt: 'Animate the still',
+      images: ['still.png'],
+      output: 'wan.mp4',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(submit?.init?.body)).input.image)
+      .toBe('https://api.pruna.ai/v1/files/file-abc123');
+  });
+
+  it.each([
+    { surface: 'image' as const, model: 'p-image-edit', output: 'missing-edit.png' },
+    { surface: 'image' as const, model: 'qwen-image-edit-plus-pruna', output: 'missing-qwen.png' },
+    { surface: 'video' as const, model: 'wan-i2v-pruna', output: 'missing-i2v.mp4' },
+  ])('rejects $model without a reference image before making a request', async ({ surface, model, output }) => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('network should not be reached without a required image');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface,
+      model,
+      prompt: 'Missing required input',
+      output,
+    })).rejects.toThrow(/requires at least one reference image/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses match_input_image for p-image-edit when no aspect was requested', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'ref.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/edit-default/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Keep the input framing',
+      image: 'ref.png',
+      output: 'match-input.png',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(submit?.init?.body)).input.aspect_ratio).toBe('match_input_image');
+  });
+
+  it('preserves an explicit aspect ratio for p-image-edit', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'ref.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/edit-aspect/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Crop deliberately',
+      aspect: '16:9',
+      image: 'ref.png',
+      output: 'explicit-aspect.png',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(submit?.init?.body)).input.aspect_ratio).toBe('16:9');
+  });
+
+  it('uses the custom model configured in Settings', async () => {
+    await writeMediaConfig({ model: 'z-image-turbo' });
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/custom/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    const result = await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Use the configured model',
+      output: 'custom-model.png',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(submit?.init?.headers).toMatchObject({ Model: 'z-image-turbo' });
+    expect(result.providerNote).toContain('pruna/z-image-turbo');
+  });
+
+  it('keeps the full custom base path for root-relative status and file URLs', async () => {
+    await writeMediaConfig({ baseUrl: 'https://gateway.example/pruna/v1' });
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: '/files/output.jpg',
+      outputBytes: PNG_BYTES,
+      submitBody: { id: 'gw-short', get_url: '/predictions/status/gw-short' },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Preserve the gateway path',
+      output: 'gateway-short.png',
+    });
+
+    expect(calls.find((call) => call.url.includes('/predictions/status/'))?.url)
+      .toBe('https://gateway.example/pruna/v1/predictions/status/gw-short');
+    expect(calls.find((call) => call.url.includes('/files/output.jpg'))?.url)
+      .toBe('https://gateway.example/pruna/v1/files/output.jpg');
+  });
+
+  it('falls back safely for unsupported aspect and resolution values', async () => {
+    const imageCalls: Call[] = [];
+    stubPruna({
+      calls: imageCalls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/fallback-image/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Fallback image',
+      aspect: '21:9',
+      output: 'fallback-image.png',
+    });
+    const imageSubmit = imageCalls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(imageSubmit?.init?.body)).input.aspect_ratio).toBe('1:1');
+
+    const videoCalls: Call[] = [];
+    stubPruna({
+      calls: videoCalls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/fallback-video/output.mp4',
+      outputBytes: MP4_BYTES,
+      submitBody: { id: 'fallback-video', get_url: '/v1/predictions/status/fallback-video' },
+    });
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'video',
+      model: 'p-video',
+      prompt: 'Fallback video',
+      resolution: '4k',
+      output: 'fallback-video.mp4',
+    });
+    const videoSubmit = videoCalls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(videoSubmit?.init?.body)).input.resolution).toBe('720p');
+  });
+
+  it('surfaces upload, poll, and download HTTP failures clearly', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'ref.png'), PNG_BYTES);
+    const uploadFetch = vi.fn(async () => new Response('upload denied', { status: 401 }));
+    vi.stubGlobal('fetch', uploadFetch);
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image-edit',
+      prompt: 'Upload failure',
+      image: 'ref.png',
+      output: 'upload-failure.png',
+    })).rejects.toThrow(/Pruna file upload 401/i);
+
+    const pollFetch = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      return url.endsWith('/predictions')
+        ? jsonResponse({ id: 'poll-failure', get_url: '/v1/predictions/status/poll-failure' })
+        : new Response('poll denied', { status: 401 });
+    });
+    vi.stubGlobal('fetch', pollFetch);
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Poll failure',
+      output: 'poll-failure.png',
+    })).rejects.toThrow(/Pruna poll 401/i);
+
+    const downloadFetch = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      return url.endsWith('/predictions')
+        ? jsonResponse({
+            status: 'succeeded',
+            generation_url: '/v1/predictions/delivery/xezq/denied/output.jpg',
+          })
+        : new Response('download denied', { status: 401 });
+    });
+    vi.stubGlobal('fetch', downloadFetch);
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Download failure',
+      output: 'download-failure.png',
+    })).rejects.toThrow(/Pruna image download 401/i);
+  });
+
   it('surfaces a failed prediction instead of polling to the ceiling', async () => {
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = String(input);
@@ -558,7 +1072,7 @@ describe('pruna media generation', () => {
       model: 'p-image',
       prompt: 'No key configured',
       output: 'nokey.png',
-    })).rejects.toThrow(/no Pruna API key/);
+    })).rejects.toThrow(/OD_PRUNA_API_KEY.*PRUNA_API_KEY/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
