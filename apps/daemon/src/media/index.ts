@@ -4094,23 +4094,29 @@ async function renderPrunaImage(
   const refs = ctx.imageRefs.length
     ? ctx.imageRefs
     : (ctx.imageRef ? [ctx.imageRef] : []);
-  let droppedRefsNote = '';
+  let refsNote = '';
   if (refs.length) {
-    const accepted = refs.slice(0, PRUNA_MAX_REFERENCE_IMAGES);
+    const multiImage = PRUNA_MULTI_IMAGE_INPUT.has(wireModel);
+    // Upload only what the model will read. A single-image model given five
+    // references would otherwise cost five round trips and four discarded
+    // uploads before the request even leaves.
+    const limit = multiImage ? PRUNA_MAX_REFERENCE_IMAGES : 1;
+    const accepted = refs.slice(0, limit);
     if (accepted.length < refs.length) {
-      droppedRefsNote =
-        ` (${refs.length} references given, first ${PRUNA_MAX_REFERENCE_IMAGES} sent)`;
+      refsNote =
+        ` (${refs.length} references given, ${accepted.length} sent — ` +
+        `${wireModel} accepts ${limit})`;
     }
     const urls: string[] = [];
     for (const ref of accepted) {
       urls.push(await prunaUploadReference(ctx, baseUrl, apiKey, ref));
     }
-    if (PRUNA_MULTI_IMAGE_INPUT.has(wireModel)) {
+    if (multiImage) {
       input.images = urls;
     } else {
-      // A t2i model given a reference image: pass the first one through as a
-      // single `image` and let the API reject it if the model has no such
-      // input, rather than silently dropping what the user asked for.
+      // A t2i model handed a reference image: pass it through as a single
+      // `image` and let the API reject it if the model has no such input,
+      // rather than silently dropping what the user asked for.
       input.image = urls[0];
     }
   }
@@ -4124,7 +4130,7 @@ async function renderPrunaImage(
   return {
     bytes,
     providerNote:
-      `pruna/${wireModel} · ${aspectRatio}${droppedRefsNote} · ${bytes.length} bytes`,
+      `pruna/${wireModel} · ${aspectRatio}${refsNote} · ${bytes.length} bytes`,
     suggestedExt: sniffImageExt(bytes),
   };
 }

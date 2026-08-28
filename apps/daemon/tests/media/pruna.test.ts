@@ -381,6 +381,143 @@ describe('pruna media generation', () => {
     expect(body.input).not.toHaveProperty('aspect_ratio');
   });
 
+  it('sends one reference to a single-image model and says so', async () => {
+    await writeFile(path.join(projectsRoot, 'project-1', 'a.png'), PNG_BYTES);
+    await writeFile(path.join(projectsRoot, 'project-1', 'b.png'), PNG_BYTES);
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/abc/output.jpg',
+      outputBytes: PNG_BYTES,
+    });
+
+    const result = await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      // p-image has a single `image` input, so the second reference cannot be
+      // used — it must not be uploaded either.
+      model: 'p-image',
+      prompt: 'Restyle this frame',
+      image: 'a.png',
+      images: ['b.png'],
+      output: 'single-ref.png',
+    });
+
+    expect(calls.filter((c) => c.url.endsWith('/files')).length).toBe(1);
+    const submit = calls.find((c) => c.url.endsWith('/predictions'));
+    const body = JSON.parse(String(submit?.init?.body));
+    expect(body.input.image).toBe('https://api.pruna.ai/v1/files/file-abc123');
+    expect(body.input).not.toHaveProperty('images');
+    expect(result.providerNote).toContain('2 references given, 1 sent');
+  });
+
+  it('preserves a path prefix on a custom base URL when resolving delivery URLs', async () => {
+    await writeFile(path.join(projectRoot, '.od', 'media-config.json'), JSON.stringify({
+      providers: { pruna: { baseUrl: 'https://gateway.example/pruna/v1' } },
+    }), 'utf8');
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      // Root-relative, as p-image returns it. Resolving against the origin
+      // alone would drop the gateway's /pruna prefix and 404.
+      deliveryUrl: '/v1/predictions/delivery/xezq/abc/output.jpg',
+      outputBytes: PNG_BYTES,
+      submitBody: { id: 'gw1', get_url: '/v1/predictions/status/gw1' },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'A lantern in fog',
+      output: 'gateway.png',
+    });
+
+    expect(calls.find((c) => c.url.endsWith('/predictions'))?.url)
+      .toBe('https://gateway.example/pruna/v1/predictions');
+    expect(calls.find((c) => c.url.includes('/predictions/status/'))?.url)
+      .toBe('https://gateway.example/pruna/v1/predictions/status/gw1');
+    expect(calls.find((c) => c.url.includes('/predictions/delivery/'))?.url)
+      .toBe('https://gateway.example/pruna/v1/predictions/delivery/xezq/abc/output.jpg');
+  });
+
+  it('accepts a submit response that already succeeded, without polling', async () => {
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'unused',
+      outputBytes: PNG_BYTES,
+      // A fast model can settle inside the submit call even without Try-Sync.
+      submitBody: {
+        status: 'succeeded',
+        generation_url: 'https://api.pruna.ai/v1/predictions/delivery/xezq/fast/output.jpg',
+      },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'A fast result',
+      output: 'fast.png',
+    });
+
+    expect(calls.filter((c) => c.url.includes('/predictions/status/')).length).toBe(0);
+    expect(calls.find((c) => c.url.includes('/predictions/delivery/'))?.url)
+      .toBe('https://api.pruna.ai/v1/predictions/delivery/xezq/fast/output.jpg');
+  });
+
+  it('rejects a succeeded prediction that carries no generation_url', async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/predictions')) {
+        return jsonResponse({ id: 'nourl', get_url: 'https://api.pruna.ai/v1/predictions/status/nourl' });
+      }
+      return jsonResponse({ status: 'succeeded' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Missing output',
+      output: 'missing.png',
+    })).rejects.toThrow(/succeeded without generation_url/);
+  });
+
+  it('rejects a zero-byte delivery instead of writing an empty file', async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/predictions')) {
+        return jsonResponse({
+          status: 'succeeded',
+          generation_url: 'https://api.pruna.ai/v1/predictions/delivery/xezq/empty/output.jpg',
+        });
+      }
+      return new Response(Buffer.alloc(0), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'p-image',
+      prompt: 'Empty delivery',
+      output: 'empty.png',
+    })).rejects.toThrow(/download returned 0 bytes/);
+  });
+
   it('surfaces a failed prediction instead of polling to the ceiling', async () => {
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = String(input);
