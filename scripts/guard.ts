@@ -10,6 +10,7 @@ import { checkDesignSystemPackageQuality } from "./check-design-system-package-q
 import { checkDesignSystemComponentFixtureReport } from "./check-components-fixtures.ts";
 import { checkDesignSystemFlagParity } from "./check-design-system-flag-parity.ts";
 import { checkComponentsManifestExtraction } from "./check-components-manifest-extraction.ts";
+import { checkHtmlPluginPreviewContracts } from "./check-html-plugin-preview-contracts.ts";
 import { checkPluginPreviewManifest } from "./check-plugin-preview-manifest.ts";
 import {
   checkDesignSystemA1RequiredTokens,
@@ -26,6 +27,7 @@ import { runGuardChecks, type GuardCheck, type GuardContext } from "./lib/guard/
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const allowedE2eScripts = new Set([
+  "e2e/scripts/artifact-render-parity.ts",
   "e2e/scripts/playwright.ts",
   "e2e/scripts/release-smoke.ts",
   "e2e/scripts/visual-report.ts",
@@ -113,7 +115,7 @@ const residualAllowedExactPaths = new Set([
   // `dist/acp.js` and drives a real `vela agent run` against a live model.
   // Kept as .mjs so it can be invoked directly via Node without any transform.
   "apps/daemon/scripts/verify-amr-real-vela.mjs",
-  // Fake `vela agent run --runtime opencode` ACP stdio stub used by the AMR
+  // Fake `vela agent run` ACP stdio stub used by the AMR
   // integration tests. The Vitest test spawns it via `child_process.spawn`,
   // which needs a directly-executable file (shebang + .mjs).
   "apps/daemon/tests/fixtures/fake-vela.mjs",
@@ -264,6 +266,18 @@ async function checkResidualJavaScript(): Promise<boolean> {
   }
 
   console.log("Residual JavaScript check passed: project-owned code is TypeScript-only.");
+  return true;
+}
+
+export async function checkRootPackageManagerLockfiles(root: string = repoRoot): Promise<boolean> {
+  const entries = await readdir(root);
+  if (entries.includes("bun.lock")) {
+    console.error("Unexpected root bun.lock found.");
+    console.error("pnpm-lock.yaml is the repository's only dependency lockfile; remove bun.lock.");
+    return false;
+  }
+
+  console.log("Root package-manager lockfile check passed: no bun.lock found.");
   return true;
 }
 
@@ -1147,7 +1161,7 @@ const hardcodedColorAllowlist: StylePolicyAllowlistEntry[] = [
     reason: "global token definitions, shadows, overlays, and retained migration inventory live in the CSS source of truth",
   },
   {
-    pathPattern: /^apps\/web\/src\/components\/(?:AgentIcon|PaletteTweaks|PetSettings|SettingsDialog)\.tsx$/,
+    pathPattern: /^apps\/web\/src\/components\/(?:AgentIcon|PetSettings|SettingsDialog)\.tsx$/,
     valuePattern: /^(?:#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\))$/,
     reason: "brand accents, user accent choices, and legacy token fallbacks are classified as Phase 1 migration inventory",
   },
@@ -1479,6 +1493,7 @@ async function checkRunStartChokePoint(): Promise<boolean> {
 
 const checks: GuardCheck[] = [
   { name: "residual JavaScript", run: checkResidualJavaScript },
+  { name: "root package-manager lockfile", run: ({ repoRoot: root }) => checkRootPackageManagerLockfiles(root) },
   { name: "package dependency specs", run: checkPackageDependencySpecs },
   { name: "product neutrality", run: checkProductNeutrality },
   { name: "cross-app imports", run: checkCrossAppImportsOnce },
@@ -1494,6 +1509,7 @@ const checks: GuardCheck[] = [
   { name: "tools layout", run: checkToolsLayout },
   { name: "style policy", run: checkStylePolicy },
   { name: "craft references", run: checkCraftReferences },
+  { name: "HTML plugin preview contracts", run: ({ repoRoot: root }) => checkHtmlPluginPreviewContracts(root) },
   { name: "plugin preview manifest", run: checkPluginPreviewManifest },
   { name: "design system manifests", run: checkDesignSystemManifests },
   { name: "design system package quality", run: checkDesignSystemPackageQuality },
