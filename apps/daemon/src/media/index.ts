@@ -3906,6 +3906,12 @@ const PRUNA_MATCH_INPUT_ASPECT_MODELS = new Set([
 
 const PRUNA_ASPECT_RATIOS = new Set(['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3']);
 const PRUNA_VIDEO_RESOLUTIONS = new Set(['720p', '1080p']);
+const PRUNA_WAN_RESOLUTIONS = new Set(['480p', '720p']);
+const PRUNA_WAN_ASPECT_RATIOS = new Set(['16:9', '9:16']);
+const PRUNA_WAN_MIN_FRAMES = 81;
+const PRUNA_WAN_MAX_FRAMES = 121;
+const PRUNA_WAN_MIN_FPS = 5;
+const PRUNA_WAN_MAX_FPS = 30;
 const PRUNA_MIN_VIDEO_SECONDS = 1;
 const PRUNA_MAX_VIDEO_SECONDS = 20;
 // Reference-image count p-image-edit accepts per the API docs.
@@ -3945,6 +3951,70 @@ function prunaBaseUrl(credentials: ProviderConfig): string {
 
 function prunaAspectFor(aspect: string | undefined, fallback: string): string {
   return aspect && PRUNA_ASPECT_RATIOS.has(aspect) ? aspect : fallback;
+}
+
+type PrunaWanTiming = {
+  numFrames: number;
+  framesPerSecond: number;
+  effectiveSeconds: number;
+  note: string;
+};
+
+function prunaWanTiming(requestedSeconds: number | undefined): PrunaWanTiming {
+  // Preserve Pruna's documented default when OpenDesign did not request a
+  // length. Explicit UI buckets are mapped to the closest legal frame/fps
+  // pair, preferring fewer frames when multiple pairs have equal error.
+  if (requestedSeconds == null) {
+    return {
+      numFrames: 81,
+      framesPerSecond: 16,
+      effectiveSeconds: 81 / 16,
+      note: '',
+    };
+  }
+
+  let best: Omit<PrunaWanTiming, 'note'> | null = null;
+  let bestError = Number.POSITIVE_INFINITY;
+  for (let fps = PRUNA_WAN_MIN_FPS; fps <= PRUNA_WAN_MAX_FPS; fps += 1) {
+    const numFrames = Math.min(
+      Math.max(Math.round(requestedSeconds * fps), PRUNA_WAN_MIN_FRAMES),
+      PRUNA_WAN_MAX_FRAMES,
+    );
+    const effectiveSeconds = numFrames / fps;
+    const error = Math.abs(effectiveSeconds - requestedSeconds);
+    if (
+      error < bestError - Number.EPSILON
+      || (Math.abs(error - bestError) <= Number.EPSILON
+        && (best == null || numFrames < best.numFrames))
+    ) {
+      best = { numFrames, framesPerSecond: fps, effectiveSeconds };
+      bestError = error;
+    }
+  }
+
+  if (!best) throw new Error('Pruna Wan timing could not be resolved.');
+  const maxDuration = PRUNA_WAN_MAX_FRAMES / PRUNA_WAN_MIN_FPS;
+  const note = requestedSeconds > maxDuration
+    ? ` (requested ${requestedSeconds}s → capped to ${maxDuration.toFixed(1)}s)`
+    : '';
+  return { ...best, note };
+}
+
+function prunaWanResolution(requested: string | undefined): {
+  value: string;
+  note: string;
+} {
+  if (requested && PRUNA_WAN_RESOLUTIONS.has(requested)) {
+    return { value: requested, note: '' };
+  }
+  if (requested) {
+    return { value: '720p', note: ` (requested ${requested} → capped to 720p)` };
+  }
+  return { value: '480p', note: '' };
+}
+
+function prunaWanAspect(aspect: string | undefined): string {
+  return aspect && PRUNA_WAN_ASPECT_RATIOS.has(aspect) ? aspect : '16:9';
 }
 
 function prunaMaxPollMs(defaultMs: number): number {
@@ -4328,33 +4398,61 @@ async function renderPrunaVideo(
     throw new Error(`Pruna model ${wireModel} requires at least one reference image.`);
   }
 
-  // Pruna caps duration at 20s. The dispatcher clamps to VIDEO_LENGTHS_SEC,
-  // which goes up to 30 — re-clamp so a user who picked 30 does not bounce
-  // off the upstream API with a 4xx.
-  const requestedSec = ctx.length || 5;
-  const durationSec = Math.min(
-    Math.max(Math.round(requestedSec), PRUNA_MIN_VIDEO_SECONDS),
-    PRUNA_MAX_VIDEO_SECONDS,
-  );
-  const durationSnappedNote = durationSec !== requestedSec
-    ? ` (requested ${requestedSec}s → clamped to ${durationSec}s)`
-    : '';
-  const resolution = ctx.resolution && PRUNA_VIDEO_RESOLUTIONS.has(ctx.resolution)
-    ? ctx.resolution
-    : '720p';
+  const isWanT2V = wireModel === 'wan-t2v';
+  const isWanI2V = wireModel === 'wan-i2v';
+  const isWan = isWanT2V || isWanI2V;
+  let input: Record<string, unknown>;
+  let providerDetails: string;
 
-  const input: Record<string, unknown> = {
-    prompt: ctx.prompt || 'A short cinematic clip.',
-    duration: durationSec,
-    resolution,
-  };
-
-  if (videoReference) {
-    input.image = await prunaUploadReference(ctx, baseUrl, apiKey, videoReference);
-    // aspect_ratio is documented as ignored once an input image is present;
-    // sending it anyway would imply a framing the model will not honour.
+  if (isWan) {
+    const timing = prunaWanTiming(ctx.length);
+    const resolution = prunaWanResolution(ctx.resolution);
+    input = {
+      prompt: ctx.prompt || 'A short cinematic clip.',
+      num_frames: timing.numFrames,
+      resolution: resolution.value,
+    };
+    if (isWanI2V) {
+      input.image = await prunaUploadReference(ctx, baseUrl, apiKey, videoReference!);
+    } else {
+      input.aspect_ratio = prunaWanAspect(ctx.aspect);
+    }
+    input.frames_per_second = timing.framesPerSecond;
+    const framing = isWanI2V ? 'from input image' : String(input.aspect_ratio);
+    const effectiveSeconds = Number(timing.effectiveSeconds.toFixed(2));
+    providerDetails =
+      `${framing} · ${resolution.value}${resolution.note} · ` +
+      `${timing.numFrames}f@${timing.framesPerSecond}fps · ` +
+      `${effectiveSeconds}s${timing.note}`;
   } else {
-    input.aspect_ratio = prunaAspectFor(ctx.aspect, '16:9');
+    // p-video supports 1-20 seconds and 720p/1080p. The dispatcher clamps to
+    // VIDEO_LENGTHS_SEC, which goes up to 30, so enforce the provider ceiling.
+    const requestedSec = ctx.length || 5;
+    const durationSec = Math.min(
+      Math.max(Math.round(requestedSec), PRUNA_MIN_VIDEO_SECONDS),
+      PRUNA_MAX_VIDEO_SECONDS,
+    );
+    const durationSnappedNote = durationSec !== requestedSec
+      ? ` (requested ${requestedSec}s → clamped to ${durationSec}s)`
+      : '';
+    const resolution = ctx.resolution && PRUNA_VIDEO_RESOLUTIONS.has(ctx.resolution)
+      ? ctx.resolution
+      : '720p';
+    input = {
+      prompt: ctx.prompt || 'A short cinematic clip.',
+      duration: durationSec,
+      resolution,
+    };
+    if (videoReference) {
+      input.image = await prunaUploadReference(ctx, baseUrl, apiKey, videoReference);
+    } else {
+      input.aspect_ratio = prunaAspectFor(ctx.aspect, '16:9');
+    }
+    const framing = typeof input.aspect_ratio === 'string'
+      ? input.aspect_ratio
+      : 'from input image';
+    providerDetails =
+      `${framing} · ${resolution} · ${durationSec}s${durationSnappedNote}`;
   }
 
   const generationUrl = await prunaPredict(
@@ -4362,13 +4460,10 @@ async function renderPrunaVideo(
     prunaMaxPollMs(10 * 60 * 1000), onProgress,
   );
   const bytes = await prunaDownload(ctx, baseUrl, apiKey, generationUrl, 'video');
-  const framing = typeof input.aspect_ratio === 'string' ? input.aspect_ratio : 'from input image';
 
   return {
     bytes,
-    providerNote:
-      `pruna/${wireModel} · ${framing} · ${resolution} · ` +
-      `${durationSec}s${durationSnappedNote} · ${bytes.length} bytes`,
+    providerNote: `pruna/${wireModel} · ${providerDetails} · ${bytes.length} bytes`,
     suggestedExt: '.mp4',
   };
 }

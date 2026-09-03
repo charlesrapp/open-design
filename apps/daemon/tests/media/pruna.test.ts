@@ -791,14 +791,85 @@ describe('pruna media generation', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('uses the first images entry as the wan-i2v primary reference', async () => {
+  it.each([
+    { length: 3, numFrames: 81, fps: 27 },
+    { length: 5, numFrames: 85, fps: 17 },
+    { length: 10, numFrames: 90, fps: 9 },
+    { length: 15, numFrames: 90, fps: 6 },
+  ])('maps the $length second Wan bucket to $numFrames frames at $fps fps', async ({
+    length,
+    numFrames,
+    fps,
+  }) => {
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: `https://api.pruna.ai/v1/predictions/delivery/xezq/wan-${length}/output.mp4`,
+      outputBytes: MP4_BYTES,
+      submitBody: { id: `wan-${length}`, get_url: `/v1/predictions/status/wan-${length}` },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'video',
+      model: 'wan-t2v-pruna',
+      prompt: 'Map the duration',
+      length,
+      output: `wan-${length}.mp4`,
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    const input = JSON.parse(String(submit?.init?.body)).input;
+    expect(input.num_frames).toBe(numFrames);
+    expect(input.frames_per_second).toBe(fps);
+    expect(input).not.toHaveProperty('duration');
+  });
+
+  it('shapes wan-t2v with frames and fps instead of p-video duration', async () => {
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/wan-t2v/output.mp4',
+      outputBytes: MP4_BYTES,
+      submitBody: { id: 'wan-t2v', get_url: '/v1/predictions/status/wan-t2v' },
+    });
+
+    await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'video',
+      model: 'wan-t2v-pruna',
+      prompt: 'A cinematic beach drive',
+      aspect: '9:16',
+      length: 8,
+      resolution: '480p',
+      output: 'wan-t2v.mp4',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(submit?.init?.headers).toMatchObject({ Model: 'wan-t2v' });
+    expect(JSON.parse(String(submit?.init?.body))).toEqual({
+      input: {
+        prompt: 'A cinematic beach drive',
+        num_frames: 88,
+        resolution: '480p',
+        aspect_ratio: '9:16',
+        frames_per_second: 11,
+      },
+    });
+  });
+
+  it('shapes wan-i2v with its exact default frame contract', async () => {
     await writeFile(path.join(projectsRoot, 'project-1', 'still.png'), PNG_BYTES);
     const calls: Call[] = [];
     stubPruna({
       calls,
-      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/wan/output.mp4',
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/wan-i2v/output.mp4',
       outputBytes: MP4_BYTES,
-      submitBody: { id: 'wan', get_url: '/v1/predictions/status/wan' },
+      submitBody: { id: 'wan-i2v', get_url: '/v1/predictions/status/wan-i2v' },
     });
 
     await generateMedia({
@@ -809,12 +880,54 @@ describe('pruna media generation', () => {
       model: 'wan-i2v-pruna',
       prompt: 'Animate the still',
       images: ['still.png'],
-      output: 'wan.mp4',
+      output: 'wan-i2v.mp4',
     });
 
     const submit = calls.find((call) => call.url.endsWith('/predictions'));
-    expect(JSON.parse(String(submit?.init?.body)).input.image)
-      .toBe('https://api.pruna.ai/v1/files/file-abc123');
+    expect(submit?.init?.headers).toMatchObject({ Model: 'wan-i2v' });
+    expect(JSON.parse(String(submit?.init?.body))).toEqual({
+      input: {
+        prompt: 'Animate the still',
+        image: 'https://api.pruna.ai/v1/files/file-abc123',
+        num_frames: 81,
+        resolution: '480p',
+        frames_per_second: 16,
+      },
+    });
+  });
+
+  it('caps a 30s Wan request at the longest valid frame duration', async () => {
+    const calls: Call[] = [];
+    stubPruna({
+      calls,
+      deliveryUrl: 'https://api.pruna.ai/v1/predictions/delivery/xezq/wan-long/output.mp4',
+      outputBytes: MP4_BYTES,
+      submitBody: { id: 'wan-long', get_url: '/v1/predictions/status/wan-long' },
+    });
+
+    const result = await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'video',
+      model: 'wan-t2v-pruna',
+      prompt: 'A long cinematic shot',
+      length: 30,
+      resolution: '1080p',
+      output: 'wan-long.mp4',
+    });
+
+    const submit = calls.find((call) => call.url.endsWith('/predictions'));
+    expect(JSON.parse(String(submit?.init?.body))).toEqual({
+      input: {
+        prompt: 'A long cinematic shot',
+        num_frames: 121,
+        resolution: '720p',
+        aspect_ratio: '16:9',
+        frames_per_second: 5,
+      },
+    });
+    expect(result.providerNote).toContain('requested 30s → capped to 24.2s');
   });
 
   it.each([
